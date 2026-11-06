@@ -214,9 +214,7 @@ impl<'a> ChannelOptions<'a> {
 
 /// One side of a Protomux channel. Dropping it closes the channel.
 pub struct Channel {
-    mux: Mux,
-    local_id: u64,
-    serial: u64,
+    tx: ChannelSender,
     rx: mpsc::UnboundedReceiver<Event>,
 }
 
@@ -341,9 +339,11 @@ impl Mux {
             self.fully_open(st, local_id, remote_id);
         }
         Some(Channel {
-            mux: self.clone(),
-            local_id,
-            serial,
+            tx: ChannelSender {
+                mux: self.clone(),
+                local_id,
+                serial,
+            },
             rx,
         })
     }
@@ -748,11 +748,17 @@ impl Mux {
 
 impl Channel {
     pub fn local_id(&self) -> u64 {
-        self.local_id
+        self.tx.local_id
     }
 
     pub fn mux(&self) -> &Mux {
-        &self.mux
+        &self.tx.mux
+    }
+
+    /// A cloneable handle for sending on (and closing) this channel from
+    /// other tasks.
+    pub fn sender(&self) -> ChannelSender {
+        self.tx.clone()
     }
 
     /// Next event; `None` after `Closed` has been received.
@@ -769,11 +775,49 @@ impl Channel {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// See [`ChannelSender::send`].
+    pub fn send<T: Codec>(&self, kind: u64, msg: &T) -> bool {
+        self.tx.send(kind, msg)
+    }
+
+    pub fn send_raw(&self, kind: u64, data: &[u8]) -> bool {
+        self.tx.send_raw(kind, data)
+    }
+
+    pub fn close(&self) {
+        self.tx.close()
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.tx.close()
+    }
+}
+
+/// Sending half of a [`Channel`]. Outlives nothing: once the channel closes,
+/// sends return false.
+#[derive(Clone)]
+pub struct ChannelSender {
+    mux: Mux,
+    local_id: u64,
+    serial: u64,
+}
+
+impl ChannelSender {
     fn live<'a>(&self, st: &'a mut State) -> Option<&'a mut Slot> {
         st.local
             .get_mut(self.local_id as usize - 1)?
             .as_mut()
             .filter(|s| s.serial == self.serial)
+    }
+
+    pub fn mux(&self) -> &Mux {
+        &self.mux
     }
 
     pub fn is_closed(&self) -> bool {
@@ -811,11 +855,5 @@ impl Channel {
             self.mux
                 .write(&mut st, 0, CONTROL_CLOSE, uint_len(id), |w| w.uint(id));
         }
-    }
-}
-
-impl Drop for Channel {
-    fn drop(&mut self) {
-        self.close()
     }
 }
