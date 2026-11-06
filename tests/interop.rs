@@ -1,5 +1,5 @@
-//! A Node peer (npm protomux over @hyperswarm/secret-stream) against a Rust
-//! peer (protomux-rs over peeroxide's secret-stream), over TCP, with each side
+//! A Node peer (npm protomux on Hyperswarm) against a Rust peer (protomux-rs
+//! on a peeroxide swarm), on a local HyperDHT testnet over UDX, with each side
 //! as the Noise initiator in turn.
 
 use std::path::Path;
@@ -7,13 +7,15 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use compact_encoding::{Bytes, decode, encode};
-use peeroxide_dht::noise::generate_keypair;
-use peeroxide_dht::secret_stream::SecretStream;
+use peeroxide::{JoinOpts, SwarmConfig, SwarmHandle, spawn};
+use peeroxide_dht::hyperdht::HyperDhtConfig;
+use peeroxide_dht::rpc::DhtConfig;
 use protomux::{Channel, ChannelOptions, Event, Mux};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
+
+const TOPIC: [u8; 32] = [0x3d; 32];
 
 fn js_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js"))
@@ -45,6 +47,7 @@ fn spawn_node(args: &[&str]) -> Child {
         .args(args)
         .current_dir(js_dir())
         .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("node on PATH")
@@ -197,33 +200,62 @@ async fn run(mux: Mux, mut node: Child) {
     );
 }
 
+/// Starts the JS peer, joins its testnet from Rust, and returns the first
+/// connection's mux. `rust_client`: Rust looks the topic up (Noise initiator).
+async fn connect(js_role: &str, rust_client: bool) -> (Mux, Child, SwarmHandle) {
+    let mut node = spawn_node(&[js_role]);
+    let mut stdout = BufReader::new(node.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).await.unwrap();
+    let port = first
+        .trim()
+        .strip_prefix("bootstrap ")
+        .expect("bootstrap line")
+        .to_owned();
+    if rust_client {
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).await.unwrap();
+        assert_eq!(ready.trim(), "ready");
+    }
+    node.stdout = Some(stdout.into_inner());
+    let mut dht = DhtConfig::default();
+    dht.bootstrap = vec![format!("127.0.0.1:{port}")];
+    dht.host = "127.0.0.1".into();
+    dht.port = 0;
+    let mut hyper = HyperDhtConfig::default();
+    hyper.dht = dht;
+    let mut config = SwarmConfig::default();
+    config.dht = hyper;
+    let (_task, swarm, mut conns) = spawn(config).await.expect("peeroxide swarm");
+    let mut opts = JoinOpts::default();
+    opts.client = rust_client;
+    opts.server = !rust_client;
+    swarm.join(TOPIC, opts).await.unwrap();
+    if !rust_client {
+        swarm.flush().await.unwrap();
+        let stdin = node.stdin.as_mut().unwrap();
+        stdin.write_all(b"go\n").await.unwrap();
+    }
+    let conn = timeout(Duration::from_secs(60), conns.recv())
+        .await
+        .expect("no connection over the testnet")
+        .unwrap();
+    assert_eq!(conn.peer.stream.is_initiator(), rust_client);
+    (Mux::from_secret_stream(conn.peer.stream), node, swarm)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs node and `npm install` in tests/js"]
 async fn js_initiator_rust_responder() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
-    let node = spawn_node(&["connect", &port]);
-    let (tcp, _) = listener.accept().await.unwrap();
-    let ss = SecretStream::new(false, tcp, generate_keypair())
-        .await
-        .unwrap();
-    run(Mux::from_secret_stream(ss), node).await;
+    let (mux, node, swarm) = connect("connect", false).await;
+    run(mux, node).await;
+    let _ = swarm.destroy().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs node and `npm install` in tests/js"]
 async fn rust_initiator_js_responder() {
-    let mut node = spawn_node(&["listen"]);
-    let mut stdout = BufReader::new(node.stdout.take().unwrap());
-    let mut first = String::new();
-    stdout.read_line(&mut first).await.unwrap();
-    let port = first.trim().strip_prefix("port ").expect("port line");
-    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    let ss = SecretStream::new(true, tcp, generate_keypair())
-        .await
-        .unwrap();
-    node.stdout = Some(stdout.into_inner());
-    run(Mux::from_secret_stream(ss), node).await;
+    let (mux, node, swarm) = connect("listen", true).await;
+    run(mux, node).await;
+    let _ = swarm.destroy().await;
 }

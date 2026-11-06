@@ -24,3 +24,4 @@ tokio = { version = "1.40", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full"] }
+peeroxide = "1.7.4"

@@ -53,10 +53,11 @@ cork our replies; a nested batch frame (never produced by either implementation)
 ## Tests
 
 - `cargo test`: protocol tests over the in-memory transport.
-- `tests/interop.rs`: a Node peer running npm protomux over `@hyperswarm/secret-stream`, connected
-  over TCP to a Rust peer on peeroxide's secret-stream. Both sides open, pair, batch, reject and
-  stream 8 MiB through a back-pressured channel, in both connection directions. Needs
-  `npm install` in `tests/js`.
+- `tests/interop.rs`: a Node peer running npm protomux on Hyperswarm and a Rust peer on a
+  peeroxide swarm, on a local HyperDHT testnet, so the connection is holepunched UDX with
+  secret-stream as apps run it. Both sides open, pair, batch, reject and stream 8 MiB through a
+  back-pressured channel, with each side as the Noise initiator in turn. Needs `npm install` in
+  `tests/js`.
 - `fuzz/`: `cargo +nightly fuzz run frame` exercises the frame decoder.
 
 ## License

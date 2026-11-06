@@ -1,25 +1,37 @@
-// npm protomux peer for tests/interop.rs.
-// usage: node peer.js connect <port>   (TCP client, Noise initiator)
-//        node peer.js listen           (prints "port <n>", Noise responder)
-const net = require('net')
-const SecretStream = require('@hyperswarm/secret-stream')
+// npm protomux peer for tests/interop.rs, over Hyperswarm on a local HyperDHT testnet (UDX).
+// usage: node peer.js connect   (topic client, Noise initiator)
+//        node peer.js listen    (topic server, Noise responder)
+// Both print "bootstrap <port>" first, for the Rust peer to join the same testnet.
+const Hyperswarm = require('hyperswarm')
+const createTestnet = require('hyperdht/testnet')
 const Protomux = require('protomux')
 const c = require('compact-encoding')
 
 const log = (s) => process.stdout.write(s + '\n')
-const [role, port] = process.argv.slice(2)
+const [role] = process.argv.slice(2)
+const TOPIC = Buffer.alloc(32, 0x3d)
 
-if (role === 'connect') run(net.connect(Number(port), '127.0.0.1'), true)
-else {
-  const server = net.createServer((socket) => {
-    server.close()
-    run(socket, false)
+// The server side announces before the client looks up: `listen` prints "ready" once announced,
+// `connect` waits for a line on stdin saying the Rust server has announced.
+;(async () => {
+  const testnet = await createTestnet(3, { host: '127.0.0.1' })
+  log('bootstrap ' + testnet.bootstrap[0].port)
+  const swarm = new Hyperswarm({ bootstrap: testnet.bootstrap })
+  let started = false
+  swarm.on('connection', (conn) => {
+    if (started) return conn.destroy()
+    started = true
+    run(conn)
   })
-  server.listen(0, '127.0.0.1', () => log('port ' + server.address().port))
-}
+  if (role === 'listen') {
+    await swarm.join(TOPIC, { server: true, client: false }).flushed()
+    log('ready')
+  } else {
+    process.stdin.once('data', () => swarm.join(TOPIC, { server: false, client: true }))
+  }
+})()
 
-function run(socket, isInitiator) {
-  const ss = new SecretStream(isInitiator, socket)
+function run(ss) {
   const mux = new Protomux(ss)
   ss.on('close', () => {
     log('stream-closed')
