@@ -25,3 +25,9 @@ tokio = { version = "1.40", features = ["sync", "rt", "macros"] }
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full"] }
 peeroxide = "1.7.4"
+
+# Our fork: UDX write pipelining, C-compatible pacing and SACKs, reachability check (see ../peeroxide).
+[patch.crates-io]
+peeroxide = { path = "../peeroxide/peeroxide" }
+peeroxide-dht = { path = "../peeroxide/peeroxide-dht" }
+libudx = { path = "../peeroxide/libudx" }

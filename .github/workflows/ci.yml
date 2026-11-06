@@ -22,6 +22,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/compact-encoding-rs
           path: compact-encoding-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/peeroxide
+          path: peeroxide
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
