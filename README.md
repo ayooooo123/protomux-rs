@@ -30,12 +30,15 @@ match cb.recv().await {
   protocol and id (`aliases` register extra names). A remote open nobody answers is rejected.
 - **Pairing** (`mux.pair()` in JS): `Mux::pair(protocol, id)` yields a `PairRequest` when the
   remote opens a channel we have not opened. Open the matching channel while holding the request;
-  the remote open is rejected when the request drops unanswered. `id: None` matches any id, which
-  is how Corestore opens cores on demand.
+  the remote open is rejected when the request drops unanswered. A remote close cancels an
+  unpaired open and releases its buffered messages, even while the request is held, so a late
+  pairing cannot resurrect the closed channel id. `id: None` matches any id, which is how Corestore
+  opens cores on demand.
 - **Setup window** (`mux.ready()`): the reader starts in `Mux::new`, so opens can arrive while the
   caller is still attaching protocols. Those are held until `Mux::pair` or a matching
   `open_channel`, or rejected by `Mux::ready()`, which declares setup done; after it, an open with
-  no pairer is rejected at once, as in JS. Call `ready()` once the protocols are attached.
+  no pairer is rejected at once, as in JS. Already delivered requests remain pending.
+  Call `ready()` once the protocols are attached.
 - **Batching**: `cork()`/`uncork()` coalesce everything sent in between into one batch frame.
   Batches from JS peers are decoded entry by entry.
 - **Back-pressure, outbound**: `Channel::send` returns `false` once more than

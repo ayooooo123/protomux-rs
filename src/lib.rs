@@ -94,8 +94,8 @@ struct Info {
     pairing: usize,
     /// Remote opens that arrived before any pairer existed for this key and
     /// before [`Mux::ready`]. Each is counted in `pairing` and queued in
-    /// `incoming`; they are handed to the first matching [`Mux::pair`] call,
-    /// or rejected by `Mux::ready` if still unpaired.
+    /// `incoming` after the delivered requests; they are handed to the first matching
+    /// [`Mux::pair`] call, or rejected by [`Mux::ready`] if still unpaired.
     unasked: usize,
     incoming: VecDeque<u64>,
     outgoing: VecDeque<u64>,
@@ -278,9 +278,9 @@ impl Mux {
             let Some(info) = st.infos.get_mut(&k) else {
                 continue;
             };
+            let ids = info.incoming.split_off(info.incoming.len() - info.unasked);
+            info.pairing -= info.unasked;
             info.unasked = 0;
-            info.pairing = 0;
-            let ids: Vec<u64> = info.incoming.drain(..).collect();
             for remote_id in ids {
                 self.reject_remote(&mut st, remote_id);
             }
@@ -380,7 +380,7 @@ impl Mux {
         info.opened += 1;
         if remote_id == 0 {
             info.outgoing.push_back(local_id);
-        } else if info.unasked > 0 {
+        } else if info.unasked > info.incoming.len() {
             // A held open nobody asked about yet: this channel settles it.
             info.unasked -= 1;
             info.pairing -= 1;
@@ -592,7 +592,7 @@ impl Mux {
         self.gc(st, k);
     }
 
-    fn reject_remote(&self, st: &mut State, remote_id: u64) {
+    fn clear_remote(&self, st: &mut State, remote_id: u64) {
         if remote_id > 0 {
             if let Some(r) = st.remote[remote_id as usize - 1].take() {
                 st.buffered -= r
@@ -604,6 +604,10 @@ impl Mux {
             }
             self.resume_maybe(st);
         }
+    }
+
+    fn reject_remote(&self, st: &mut State, remote_id: u64) {
+        self.clear_remote(st, remote_id);
         self.write(st, 0, CONTROL_REJECT, uint_len(remote_id), |w| {
             w.uint(remote_id)
         });
@@ -664,6 +668,21 @@ impl Mux {
                     .and_then(|r| r.as_ref()?.session);
                 if let Some(local_id) = session {
                     self.close_slot(st, local_id, true);
+                } else if let Some((k, index)) = st.infos.iter().find_map(|(k, info)| {
+                    info.incoming
+                        .iter()
+                        .position(|&id| id == remote_id)
+                        .map(|index| (k.clone(), index))
+                }) {
+                    let info = st.infos.get_mut(&k).expect("found");
+                    // Delivered requests still own their pairing count until dropped.
+                    if index >= info.incoming.len() - info.unasked {
+                        info.unasked -= 1;
+                        info.pairing -= 1;
+                    }
+                    info.incoming.remove(index);
+                    self.clear_remote(st, remote_id);
+                    self.gc(st, &k);
                 }
                 Ok(())
             }

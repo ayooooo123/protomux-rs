@@ -359,3 +359,94 @@ async fn destroy_closes_both_sides() {
     timeout(Duration::from_secs(5), b.closed()).await.unwrap();
     assert!(a.open_channel(opts("d", b"", b"")).is_none());
 }
+
+#[tokio::test]
+async fn close_before_async_pairing_allows_remote_id_reuse() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("lazy", None);
+    let mut markers = b.pair("marker", None);
+    let mut next_requests = b.pair("next", None);
+    let old = a.open_channel(opts("lazy", b"id", b"")).unwrap();
+    let old_id = old.local_id();
+    old.send_raw(0, b"buffered before close");
+    old.close();
+    let request = requests.recv().await.unwrap();
+
+    // The marker proves B parsed the close while its pair request was still held.
+    let mut marker_a = a.open_channel(opts("marker", b"", b"")).unwrap();
+    let marker_request = markers.recv().await.unwrap();
+    let late = b.open_channel(opts("lazy", b"id", b"")).unwrap();
+    drop(request);
+    let mut marker_b = b.open_channel(opts("marker", b"", b"")).unwrap();
+    drop(marker_request);
+    marker_a.opened().await.unwrap();
+    marker_b.opened().await.unwrap();
+
+    // A parsed the late acknowledgement and can reuse its closed channel's id.
+    let mut next_a = a.open_channel(opts("next", b"id", b"")).unwrap();
+    assert_eq!(next_a.local_id(), old_id);
+    let next_request = timeout(Duration::from_secs(5), next_requests.recv())
+        .await
+        .expect("reused channel id was not accepted")
+        .expect("mux was destroyed by the reused channel id");
+    let mut next_b = b.open_channel(opts("next", b"id", b"")).unwrap();
+    drop(next_request);
+    next_a.opened().await.unwrap();
+    next_b.opened().await.unwrap();
+    next_a.send_raw(0, b"still replicating");
+    assert_eq!(msg(&mut next_b).await.1, b"still replicating");
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
+    late.close();
+    a.destroy();
+    b.destroy();
+}
+
+#[tokio::test]
+async fn close_before_setup_does_not_leave_an_unasked_pair_request() {
+    let (a, b) = pair_of_muxes(16);
+    let mut markers = b.pair("marker", None);
+    let old = a.open_channel(opts("lazy", b"id", b"")).unwrap();
+    old.close();
+    let _marker = a.open_channel(opts("marker", b"", b"")).unwrap();
+    let marker_request = markers.recv().await.unwrap();
+    let mut requests = b.pair("lazy", None);
+    assert!(matches!(
+        requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    drop(marker_request);
+    a.destroy();
+    b.destroy();
+}
+
+#[tokio::test]
+async fn ready_rejects_only_the_unasked_tail_of_a_pairing_queue() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("p", None);
+    let mut markers = b.pair("marker", None);
+    let mut first = a.open_channel(opts("p", b"id", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    b.unpair("p", None);
+    let mut second = a
+        .open_channel(ChannelOptions {
+            unique: false,
+            ..opts("p", b"id", b"")
+        })
+        .unwrap();
+    let _marker = a.open_channel(opts("marker", b"", b"")).unwrap();
+    let marker_request = markers.recv().await.unwrap();
+
+    b.ready();
+    assert!(matches!(
+        next(&mut second).await,
+        Event::Closed { remote: true }
+    ));
+    let mut paired = b.open_channel(opts("p", b"id", b"")).unwrap();
+    drop(request);
+    assert!(first.opened().await.is_some());
+    assert!(paired.opened().await.is_some());
+    drop(marker_request);
+    a.destroy();
+    b.destroy();
+}
