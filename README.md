@@ -32,6 +32,10 @@ match cb.recv().await {
   remote opens a channel we have not opened. Open the matching channel while holding the request;
   the remote open is rejected when the request drops unanswered. `id: None` matches any id, which
   is how Corestore opens cores on demand.
+- **Setup window** (`mux.ready()`): the reader starts in `Mux::new`, so opens can arrive while the
+  caller is still attaching protocols. Those are held until `Mux::pair` or a matching
+  `open_channel`, or rejected by `Mux::ready()`, which declares setup done; after it, an open with
+  no pairer is rejected at once, as in JS. Call `ready()` once the protocols are attached.
 - **Batching**: `cork()`/`uncork()` coalesce everything sent in between into one batch frame.
   Batches from JS peers are decoded entry by entry.
 - **Back-pressure, outbound**: `Channel::send` returns `false` once more than

@@ -92,6 +92,11 @@ fn key(protocol: &str, id: Option<&[u8]>) -> Key {
 struct Info {
     opened: usize,
     pairing: usize,
+    /// Remote opens that arrived before any pairer existed for this key and
+    /// before [`Mux::ready`]. Each is counted in `pairing` and queued in
+    /// `incoming`; they are handed to the first matching [`Mux::pair`] call,
+    /// or rejected by `Mux::ready` if still unpaired.
+    unasked: usize,
     incoming: VecDeque<u64>,
     outgoing: VecDeque<u64>,
     aliases: Vec<Key>,
@@ -132,6 +137,9 @@ struct State {
     corked: usize,
     batch: Option<BatchWriter>,
     destroyed: bool,
+    /// Set by [`Mux::ready`]: protocols are attached, so an open nobody pairs
+    /// is rejected at once instead of held for a later pairer.
+    ready: bool,
 }
 
 struct Shared {
@@ -246,15 +254,72 @@ impl Mux {
         &self.shared.info
     }
 
+    /// Signals that protocols are attached and the reader may act on opens:
+    /// every remote open still waiting for a pairer is rejected, and from now
+    /// on an open with no pairer or matching local channel is rejected at once,
+    /// as JS does when its handlers exist. Idempotent.
+    ///
+    /// The reader runs from [`Mux::new`] on, so a caller that attaches
+    /// protocols afterwards must call this; without it, opens that arrived
+    /// first wait for a [`Mux::pair`] or a matching `open_channel` forever.
+    pub fn ready(&self) {
+        let mut st = self.lock();
+        if st.ready {
+            return;
+        }
+        st.ready = true;
+        let keys: Vec<Key> = st
+            .infos
+            .iter()
+            .filter(|(_, info)| info.unasked > 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            let Some(info) = st.infos.get_mut(&k) else {
+                continue;
+            };
+            info.unasked = 0;
+            info.pairing = 0;
+            let ids: Vec<u64> = info.incoming.drain(..).collect();
+            for remote_id in ids {
+                self.reject_remote(&mut st, remote_id);
+            }
+            self.gc(&mut st, &k);
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.shared.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Notifies `PairRequest`s for remote opens of `protocol`/`id` that no
     /// local channel is waiting for. `id: None` matches every id.
+    ///
+    /// Opens that arrived before any pairer existed are not rejected but
+    /// delivered here, until [`Mux::ready`] declares setup done: the reader
+    /// runs from [`Mux::new`] on, so unlike JS (whose handlers attach before
+    /// the first frame is parsed) a Rust caller may still be attaching
+    /// protocols when the remote's opens land.
     pub fn pair(&self, protocol: &str, id: Option<&[u8]>) -> mpsc::UnboundedReceiver<PairRequest> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.lock().pairs.insert(key(protocol, id), tx);
+        let k = key(protocol, id);
+        let mut st = self.lock();
+        for (held, info) in st.infos.iter_mut() {
+            let matches = held.0 == k.0 && (k.1.is_none() || held.1 == k.1);
+            if !matches {
+                continue;
+            }
+            for _ in 0..info.unasked {
+                let _ = tx.send(PairRequest {
+                    mux: Some(self.clone()),
+                    key: held.clone(),
+                    protocol: held.0.clone(),
+                    id: held.1.clone(),
+                });
+            }
+            info.unasked = 0;
+        }
+        st.pairs.insert(k, tx);
         rx
     }
 
@@ -315,6 +380,10 @@ impl Mux {
         info.opened += 1;
         if remote_id == 0 {
             info.outgoing.push_back(local_id);
+        } else if info.unasked > 0 {
+            // A held open nobody asked about yet: this channel settles it.
+            info.unasked -= 1;
+            info.pairing -= 1;
         }
         let serial = self.shared.serial.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -510,6 +579,19 @@ impl Mux {
         self.gc(st, k);
     }
 
+    /// Rejects one open nobody can pair once [`Mux::ready`] has run, leaving
+    /// any earlier request delivered to a pairer in its caller's hands.
+    fn reject_unpaired_open(&self, st: &mut State, k: &Key, remote_id: u64) {
+        if let Some(info) = st.infos.get_mut(k) {
+            info.pairing = info.pairing.saturating_sub(1);
+            if let Some(i) = info.incoming.iter().position(|&id| id == remote_id) {
+                info.incoming.remove(i);
+            }
+        }
+        self.reject_remote(st, remote_id);
+        self.gc(st, k);
+    }
+
     fn reject_remote(&self, st: &mut State, remote_id: u64) {
         if remote_id > 0 {
             if let Some(r) = st.remote[remote_id as usize - 1].take() {
@@ -638,18 +720,24 @@ impl Mux {
             .get(&k)
             .or_else(|| st.pairs.get(&(k.0.clone(), None)))
             .cloned();
+        let Some(tx) = handler else {
+            if st.ready {
+                // JS: no notify registered for the key, so reject this open now.
+                self.reject_unpaired_open(st, &k, remote_id);
+            } else {
+                // Still setting up: hold it for `pair` or a matching local open.
+                st.infos.get_mut(&k).expect("entry above").unasked += 1;
+            }
+            return Ok(());
+        };
         let req = PairRequest {
             mux: Some(self.clone()),
             key: k.clone(),
             protocol: open.protocol,
             id: open.id,
         };
-        let unsent = match handler {
-            Some(tx) => tx.send(req).err().map(|e| e.0),
-            None => Some(req),
-        };
-        if let Some(mut req) = unsent {
-            // Nobody to ask: decline now, without re-entering the lock in Drop.
+        if let Err(mpsc::error::SendError(mut req)) = tx.send(req) {
+            // The pairer went away: decline now, without re-entering the lock in Drop.
             req.mux = None;
             self.finish_pairing(st, &k);
         }

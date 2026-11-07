@@ -93,6 +93,7 @@ async fn pair_request_opens_on_demand_and_gets_buffered_messages() {
 #[tokio::test]
 async fn unanswered_open_is_rejected() {
     let (a, b) = pair_of_muxes(16);
+    b.ready();
     let mut requests = b.pair("maybe", None);
     let mut ca = a.open_channel(opts("maybe", b"x", b"")).unwrap();
     drop(requests.recv().await.unwrap()); // declined
@@ -101,13 +102,115 @@ async fn unanswered_open_is_rejected() {
         Event::Closed { remote: true }
     ));
 
-    // No pair handler at all: rejected straight away.
+    // No pair handler and setup is done: rejected straight away, as in JS.
     let mut cn = a.open_channel(opts("nobody", b"x", b"")).unwrap();
     assert!(matches!(
         next(&mut cn).await,
         Event::Closed { remote: true }
     ));
     assert!(cn.recv().await.is_none());
+}
+
+/// The open lands while the caller is still attaching protocols, so it waits;
+/// `ready()` then declares setup done and rejects it, exactly like a JS mux
+/// that had no notify registered when it parsed the frame.
+#[tokio::test]
+async fn open_before_ready_is_held_then_rejected_on_ready() {
+    let (a, b) = pair_of_muxes(16);
+    let mut cn = a.open_channel(opts("nobody", b"x", b"")).unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), cn.recv())
+            .await
+            .is_err(),
+        "an open that arrives during setup is held, not rejected"
+    );
+    b.ready();
+    assert!(matches!(
+        next(&mut cn).await,
+        Event::Closed { remote: true }
+    ));
+    assert!(cn.recv().await.is_none());
+}
+
+/// `ready()` only closes the setup window: a pairer registered before or
+/// after it still answers opens, and `ready()` twice is a no-op.
+#[tokio::test]
+async fn ready_keeps_paired_protocols_working() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("p", None);
+    b.ready();
+    b.ready();
+    let mut ca = a.open_channel(opts("p", b"id", b"hs")).unwrap();
+    let req = requests.recv().await.unwrap();
+    let mut cb = b.open_channel(opts("p", b"id", b"")).unwrap();
+    drop(req);
+    assert_eq!(&cb.opened().await.unwrap()[..], b"hs");
+    ca.opened().await.unwrap();
+}
+
+/// A request already delivered to a pairer is still the caller's to answer
+/// after `ready()`; a later open for the same key is rejected meanwhile.
+#[tokio::test]
+async fn ready_rejects_an_open_while_an_earlier_request_is_pending() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("p", None);
+    let mut first = a.open_channel(opts("p", b"1", b"")).unwrap();
+    let req = requests.recv().await.unwrap(); // delivered, not answered yet
+    b.unpair("p", None);
+    b.ready();
+
+    let mut second = a.open_channel(opts("p", b"2", b"")).unwrap();
+    assert!(matches!(
+        next(&mut second).await,
+        Event::Closed { remote: true }
+    ));
+    assert!(second.recv().await.is_none());
+
+    let mut cb = b.open_channel(opts("p", b"1", b"")).unwrap();
+    first.opened().await.unwrap();
+    cb.opened().await.unwrap();
+    drop(req);
+    first.send_raw(0, b"still-open");
+    assert_eq!(msg(&mut cb).await.1, b"still-open");
+}
+
+/// The reader runs from `Mux::new` on, so a remote open can land before the
+/// caller attached its protocols; it must still pair, by a late `pair` or a
+/// late `open_channel`, with the messages sent behind it.
+#[tokio::test]
+async fn opens_before_any_pairer_wait_for_it() {
+    let (a, b) = pair_of_muxes(16);
+    let mut by_pair = a.open_channel(opts("late", b"1", b"hs-1")).unwrap();
+    by_pair.send_raw(0, b"early");
+    let mut by_open = a.open_channel(opts("late", b"2", b"hs-2")).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await; // both opens are read by b
+
+    let mut cb2 = b.open_channel(opts("late", b"2", b"")).unwrap();
+    assert_eq!(&cb2.opened().await.unwrap()[..], b"hs-2");
+    by_open.opened().await.unwrap();
+
+    let mut requests = b.pair("late", None);
+    let req = timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&req.id.as_ref().unwrap()[..], b"1");
+    let mut cb1 = b.open_channel(opts("late", b"1", b"")).unwrap();
+    drop(req);
+    assert_eq!(&cb1.opened().await.unwrap()[..], b"hs-1");
+    assert_eq!(msg(&mut cb1).await.1, b"early");
+    by_pair.opened().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), requests.recv())
+            .await
+            .is_err(),
+        "the open settled by open_channel is not offered again"
+    );
+
+    // Nothing is left unpaired, so ready() leaves both settled channels alone.
+    b.ready();
+    cb1.send_raw(0, b"after-ready");
+    assert_eq!(msg(&mut by_pair).await.1, b"after-ready");
 }
 
 #[tokio::test]
