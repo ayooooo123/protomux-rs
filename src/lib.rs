@@ -258,7 +258,10 @@ impl Mux {
 
     /// Supplies the underlying UDX RTT in milliseconds without changing protocol frames.
     pub fn set_udx_rtt(&self, sample: impl Fn() -> u32 + Send + Sync + 'static) {
-        assert!(self.shared.udx_rtt.set(Box::new(sample)).is_ok(), "UDX RTT already set");
+        assert!(
+            self.shared.udx_rtt.set(Box::new(sample)).is_ok(),
+            "UDX RTT already set"
+        );
     }
 
     /// `None` for transports without UDX, including the in-memory transport.

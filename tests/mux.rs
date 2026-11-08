@@ -13,7 +13,10 @@ fn pair_of_muxes(capacity: usize) -> (Mux, Mux) {
 
 #[tokio::test]
 async fn udx_rtt_provider_is_live_shared_and_optional() {
-    use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
     let (a, b) = pair_of_muxes(16);
     assert_eq!(a.udx_rtt(), None);
     let rtt = Arc::new(AtomicU32::new(0));
