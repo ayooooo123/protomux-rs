@@ -11,6 +11,22 @@ fn pair_of_muxes(capacity: usize) -> (Mux, Mux) {
     )
 }
 
+#[tokio::test]
+async fn udx_rtt_provider_is_live_shared_and_optional() {
+    use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+    let (a, b) = pair_of_muxes(16);
+    assert_eq!(a.udx_rtt(), None);
+    let rtt = Arc::new(AtomicU32::new(0));
+    let sample = rtt.clone();
+    a.set_udx_rtt(move || sample.load(Ordering::Relaxed));
+    assert_eq!(a.clone().udx_rtt(), Some(0));
+    rtt.store(125, Ordering::Relaxed);
+    assert_eq!(a.udx_rtt(), Some(125));
+    assert_eq!(b.udx_rtt(), None);
+    a.destroy();
+    b.destroy();
+}
+
 async fn next(ch: &mut Channel) -> Event {
     timeout(Duration::from_secs(5), ch.recv())
         .await

@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use compact_encoding::protomux::{CONTROL_CLOSE, CONTROL_OPEN, CONTROL_REJECT, Open};
 use compact_encoding::{Bytes, Codec, Writer, uint_len};
@@ -152,6 +152,7 @@ struct Shared {
     closed: watch::Sender<bool>,
     serial: AtomicU64,
     info: StreamInfo,
+    udx_rtt: OnceLock<Box<dyn Fn() -> u32 + Send + Sync>>,
 }
 
 /// A Protomux session over one transport. Cheap to clone.
@@ -243,6 +244,7 @@ impl Mux {
                 closed,
                 serial: AtomicU64::new(0),
                 info,
+                udx_rtt: OnceLock::new(),
             }),
         };
         tokio::spawn(mux.clone().read_loop(reader));
@@ -252,6 +254,16 @@ impl Mux {
 
     pub fn stream_info(&self) -> &StreamInfo {
         &self.shared.info
+    }
+
+    /// Supplies the underlying UDX RTT in milliseconds without changing protocol frames.
+    pub fn set_udx_rtt(&self, sample: impl Fn() -> u32 + Send + Sync + 'static) {
+        assert!(self.shared.udx_rtt.set(Box::new(sample)).is_ok(), "UDX RTT already set");
+    }
+
+    /// `None` for transports without UDX, including the in-memory transport.
+    pub fn udx_rtt(&self) -> Option<u32> {
+        self.shared.udx_rtt.get().map(|sample| sample())
     }
 
     /// Signals that protocols are attached and the reader may act on opens:

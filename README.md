@@ -50,6 +50,9 @@ match cb.recv().await {
 - **Transports**: `FrameRead`/`FrameWrite` over any message-preserving stream. Implemented for
   peeroxide's secret-stream (`Mux::from_secret_stream`, feature `secret-stream`, on by default) and
   an in-memory pair (`memory::duplex`).
+  UDX hosts may call `Mux::set_udx_rtt` once, before attaching protocols, to supply
+  a live RTT sampler in milliseconds. `Mux::udx_rtt` returns `None` without one;
+  this metadata adds no frames or timers and lets Hypercore use JS's UDX windows.
 
 The mux runs one read task and one write task; both sleep until there is I/O. There are no
 timers.
