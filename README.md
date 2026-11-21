@@ -1,7 +1,7 @@
 # protomux-rs
 
-[Protomux](https://github.com/holepunchto/protomux) for Rust and tokio: many protocol channels
-over one framed, encrypted stream, wire-compatible with the npm module (3.x).
+[Protomux](https://github.com/holepunchto/protomux) 3.13.1 for Rust and tokio: many protocol
+channels over one framed, encrypted stream, wire-compatible with the npm module.
 
 ```rust
 use protomux::{ChannelOptions, Event, Mux, StreamInfo, memory};
@@ -43,10 +43,11 @@ match cb.recv().await {
   Batches from JS peers are decoded entry by entry.
 - **Back-pressure, outbound**: `Channel::send` returns `false` once more than
   `OUTBOUND_HIGH_WATER` bytes wait for the transport; `Mux::drained().await` waits for room.
-- **Back-pressure, inbound**: every received `Message` holds a share of `INBOUND_BUDGET`. When
-  consumers hold the whole budget the mux stops reading the transport, which pushes back on the
-  sender through the transport's own flow control. Messages for a remote channel that is still
-  waiting to be paired are buffered up to 32 KiB, as in JS.
+- **Back-pressure, inbound**: every received `Message` holds a share of `INBOUND_BUDGET`. Drop a
+  message before awaiting `Mux::drained()`. When consumers hold the whole budget the mux stops
+  reading message frames, which pushes back on the sender through the transport's own flow control.
+  Control frames and channels without held messages continue. Messages for a remote channel that is
+  still waiting to be paired are buffered up to 32 KiB, as in JS.
 - **Transports**: `FrameRead`/`FrameWrite` over any message-preserving stream. Implemented for
   peeroxide's secret-stream (`Mux::from_secret_stream`, feature `secret-stream`, on by default) and
   an in-memory pair (`memory::duplex`).
@@ -57,8 +58,12 @@ match cb.recv().await {
 The mux runs one read task and one write task; both sleep until there is I/O. There are no
 timers.
 
-Differences from JS: no `watch()` for passively opened channels; a JS sender's batch does not
-cork our replies; a nested batch frame (never produced by either implementation) is an error.
+## Deviations from npm
+
+- A mux destroys a remote peer that exceeds 1,024 pending remote opens. Pending open handshakes
+  count toward the 32 KiB pending buffer. npm protomux 3.13.1 leaves this backlog unbounded.
+- There is no `watch()` for passively opened channels; a JS sender's batch does not cork our
+  replies; a nested batch frame (never produced by either implementation) is an error.
 
 ## Tests
 

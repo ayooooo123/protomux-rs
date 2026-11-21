@@ -469,3 +469,64 @@ async fn ready_rejects_only_the_unasked_tail_of_a_pairing_queue() {
     a.destroy();
     b.destroy();
 }
+
+#[tokio::test]
+async fn remote_open_backlog_destroys_mux() {
+    let (a, b) = pair_of_muxes(2048);
+    let _requests = b.pair("backlog", None);
+    let mut channels = Vec::new();
+    a.cork();
+    for n in 0u16..=1024 {
+        channels.push(
+            a.open_channel(opts("backlog", &n.to_le_bytes(), b"handshake"))
+                .unwrap(),
+        );
+    }
+    a.uncork();
+
+    timeout(Duration::from_secs(5), b.closed())
+        .await
+        .expect("1025 unanswered opens must destroy the mux");
+    drop(channels);
+}
+
+#[tokio::test]
+async fn close_on_another_channel_bypasses_held_inbound_messages() {
+    let (a, b) = pair_of_muxes(32);
+    let mut bulk_a = a.open_channel(opts("bulk", b"", b"")).unwrap();
+    let mut bulk_b = b.open_channel(opts("bulk", b"", b"")).unwrap();
+    bulk_a.opened().await.unwrap();
+    bulk_b.opened().await.unwrap();
+    let mut control_a = a.open_channel(opts("control", b"", b"")).unwrap();
+    let mut control_b = b.open_channel(opts("control", b"", b"")).unwrap();
+    control_a.opened().await.unwrap();
+    control_b.opened().await.unwrap();
+
+    let chunk = vec![1; 1024 * 1024];
+    for _ in 0..8 {
+        bulk_a.send_raw(0, &chunk);
+    }
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        match next(&mut bulk_b).await {
+            Event::Message(message) => held.push(message),
+            event => panic!("expected bulk message, got {event:?}"),
+        }
+    }
+
+    control_a.close();
+    assert!(matches!(
+        next(&mut control_b).await,
+        Event::Closed { remote: true }
+    ));
+    drop(held);
+}
+
+#[tokio::test]
+async fn dropping_every_handle_closes_the_transport() {
+    let (a, b) = pair_of_muxes(1);
+    drop(a);
+    timeout(Duration::from_secs(5), b.closed())
+        .await
+        .expect("dropping the last handle must close the writer");
+}

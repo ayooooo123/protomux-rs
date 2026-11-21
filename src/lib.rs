@@ -25,6 +25,8 @@ const MAX_BUFFERED: usize = 32768;
 const MAX_BATCH: usize = 8 * 1024 * 1024;
 /// `send` reports "not drained" once this much is queued for the transport.
 pub const OUTBOUND_HIGH_WATER: usize = 2 * 1024 * 1024;
+/// Remote opens held for a pairer before the mux destroys hostile streams.
+const MAX_REMOTE_BACKLOG: usize = 1024;
 /// Received bytes that channel consumers may hold before the mux stops
 /// reading from the transport.
 pub const INBOUND_BUDGET: usize = 8 * 1024 * 1024;
@@ -35,6 +37,7 @@ pub enum Error {
     NestedBatch,
     InvalidOpen(u64),
     InvalidReject(u64),
+    RemoteBacklog,
     Io(io::Error),
 }
 
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             Error::NestedBatch => f.write_str("nested batch"),
             Error::InvalidOpen(id) => write!(f, "Invalid open message for remote id {id}"),
             Error::InvalidReject(id) => write!(f, "Invalid reject message for local id {id}"),
+            Error::RemoteBacklog => f.write_str("remote open backlog exceeded"),
             Error::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -86,6 +90,10 @@ fn key(protocol: &str, id: Option<&[u8]>) -> Key {
         protocol.to_owned(),
         id.filter(|i| !i.is_empty()).map(Bytes::copy_from_slice),
     )
+}
+
+fn remote_index(id: u64) -> Option<usize> {
+    usize::try_from(id).ok()?.checked_sub(1)
 }
 
 #[derive(Debug, Default)]
@@ -134,6 +142,7 @@ struct State {
     aliases: HashMap<Key, Key>,
     pairs: HashMap<Key, mpsc::UnboundedSender<PairRequest>>,
     buffered: usize,
+    remote_backlog: usize,
     corked: usize,
     batch: Option<BatchWriter>,
     destroyed: bool,
@@ -147,7 +156,7 @@ struct Shared {
     out: mpsc::UnboundedSender<Bytes>,
     queued: AtomicUsize,
     drained: Notify,
-    resume: Notify,
+    resume: Arc<Notify>,
     inbound: Arc<Semaphore>,
     closed: watch::Sender<bool>,
     serial: AtomicU64,
@@ -171,6 +180,8 @@ pub enum Event {
 }
 
 /// A received channel message. Holding it holds back inbound flow control.
+/// Drop it before awaiting [`Mux::drained`], or two peers holding their
+/// inbound budgets can deadlock.
 #[derive(Debug)]
 pub struct Message {
     pub kind: u64,
@@ -239,7 +250,7 @@ impl Mux {
                 out,
                 queued: AtomicUsize::new(0),
                 drained: Notify::new(),
-                resume: Notify::new(),
+                resume: Arc::new(Notify::new()),
                 inbound: Arc::new(Semaphore::new(INBOUND_BUDGET)),
                 closed,
                 serial: AtomicU64::new(0),
@@ -247,8 +258,9 @@ impl Mux {
                 udx_rtt: OnceLock::new(),
             }),
         };
-        tokio::spawn(mux.clone().read_loop(reader));
-        tokio::spawn(mux.clone().write_loop(writer, out_rx));
+        let weak = Arc::downgrade(&mux.shared);
+        tokio::spawn(Self::read_loop(weak.clone(), reader));
+        tokio::spawn(Self::write_loop(weak, writer, out_rx));
         mux
     }
 
@@ -378,9 +390,8 @@ impl Mux {
             }
         }
         if remote_id != 0
-            && st
-                .remote
-                .get(remote_id as usize - 1)
+            && remote_index(remote_id)
+                .and_then(|i| st.remote.get(i))
                 .is_none_or(Option::is_none)
         {
             return None;
@@ -527,11 +538,18 @@ impl Mux {
     }
 
     fn fully_open(&self, st: &mut State, local_id: u64, remote_id: u64) {
-        let Some(remote) = st.remote[remote_id as usize - 1].as_mut() else {
+        let Some(remote) = remote_index(remote_id)
+            .and_then(|i| st.remote.get_mut(i))
+            .and_then(Option::as_mut)
+        else {
             return;
         };
         remote.session = Some(local_id);
         let handshake = std::mem::take(&mut remote.handshake);
+        if remote.pending.is_some() {
+            st.remote_backlog -= 1;
+            st.buffered -= handshake.len();
+        }
         let pending = remote.pending.take().unwrap_or_default();
         let slot = st.local[local_id as usize - 1]
             .as_ref()
@@ -559,8 +577,8 @@ impl Mux {
         let Some(slot) = st.local[idx].take() else {
             return;
         };
-        if slot.remote_id > 0 {
-            st.remote[slot.remote_id as usize - 1] = None;
+        if let Some(remote_idx) = remote_index(slot.remote_id) {
+            st.remote[remote_idx] = None;
             st.free.push(idx);
         }
         if let Some(info) = st.infos.get_mut(&slot.key) {
@@ -608,8 +626,12 @@ impl Mux {
     }
 
     fn clear_remote(&self, st: &mut State, remote_id: u64) {
-        if remote_id > 0 {
-            if let Some(r) = st.remote[remote_id as usize - 1].take() {
+        if let Some(remote_idx) = remote_index(remote_id) {
+            if let Some(r) = st.remote[remote_idx].take() {
+                if r.pending.is_some() {
+                    st.remote_backlog -= 1;
+                    st.buffered -= r.handshake.len();
+                }
                 st.buffered -= r
                     .pending
                     .iter()
@@ -632,7 +654,7 @@ impl Mux {
         &self,
         st: &mut State,
         item: Item,
-        permit: &Arc<OwnedSemaphorePermit>,
+        permit: Option<&Arc<OwnedSemaphorePermit>>,
     ) -> Result<(), Error> {
         match item {
             Item::Message {
@@ -640,9 +662,10 @@ impl Mux {
                 kind,
                 payload,
             } => {
-                let Some(Some(r)) = st.remote.get_mut((channel as usize).wrapping_sub(1)) else {
+                let Some(Some(r)) = remote_index(channel).and_then(|i| st.remote.get_mut(i)) else {
                     return Ok(()); // closed channel: ignore, as in JS
                 };
+                let permit = permit.expect("message frame has an inbound permit");
                 if let Some(pending) = r.pending.as_mut() {
                     pending.push((kind, payload.clone(), permit.clone()));
                     st.buffered += 512 + payload.len();
@@ -677,10 +700,10 @@ impl Mux {
                 Ok(())
             }
             Item::Close { remote_id } => {
-                let session = st
-                    .remote
-                    .get((remote_id as usize).wrapping_sub(1))
-                    .and_then(|r| r.as_ref()?.session);
+                let Some(remote) = remote_index(remote_id).and_then(|i| st.remote.get(i)) else {
+                    return Ok(());
+                };
+                let session = remote.as_ref().and_then(|r| r.session);
                 if let Some(local_id) = session {
                     self.close_slot(st, local_id, true);
                 } else if let Some((k, index)) = st.infos.iter().find_map(|(k, info)| {
@@ -711,7 +734,9 @@ impl Mux {
             self.write(st, 0, CONTROL_REJECT, 1, |w| w.uint(0));
             return Ok(());
         }
-        let rid = remote_id as usize - 1;
+        let Some(rid) = remote_index(remote_id) else {
+            return Err(Error::InvalidOpen(remote_id));
+        };
         if st.remote.len() == rid {
             st.remote.push(None);
         }
@@ -742,6 +767,11 @@ impl Mux {
             return Ok(());
         }
 
+        if st.remote_backlog == MAX_REMOTE_BACKLOG {
+            return Err(Error::RemoteBacklog);
+        }
+        st.buffered += open.handshake.len();
+        st.remote_backlog += 1;
         st.remote[rid] = Some(Remote {
             session: None,
             pending: Some(Vec::new()),
@@ -778,63 +808,115 @@ impl Mux {
         Ok(())
     }
 
-    fn on_frame(&self, buf: Bytes, permit: OwnedSemaphorePermit) -> Result<(), Error> {
-        let permit = Arc::new(permit);
+    fn on_frame(
+        &self,
+        items: Vec<Item>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<(), Error> {
+        let permit = permit.map(Arc::new);
         let mut st = self.lock();
         if st.destroyed {
             return Ok(());
         }
-        match frame::decode(buf)? {
-            Frame::Single(item) => self.on_item(&mut st, item, &permit),
-            Frame::Batch(items) => {
-                for item in items {
-                    self.on_item(&mut st, item?, &permit)?;
-                    if st.destroyed {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-
-    async fn read_loop(self, mut reader: impl FrameRead) {
-        let mut closed = self.shared.closed.subscribe();
-        loop {
-            // Back-pressure for unpaired remote channels, as in JS.
-            loop {
-                let paused = {
-                    let st = self.lock();
-                    st.buffered > MAX_BUFFERED && !st.destroyed
-                };
-                if !paused {
-                    break;
-                }
-                self.shared.resume.notified().await;
-            }
-            let frame = tokio::select! {
-                f = reader.read() => f,
-                _ = closed.wait_for(|c| *c) => break,
-            };
-            let buf = match frame {
-                Ok(Some(buf)) if buf.is_empty() => continue,
-                Ok(Some(buf)) => buf,
-                Ok(None) | Err(_) => break,
-            };
-            let n = buf.len().clamp(1, INBOUND_BUDGET) as u32;
-            let permit = tokio::select! {
-                p = self.shared.inbound.clone().acquire_many_owned(n) => p.expect("semaphore never closed"),
-                _ = closed.wait_for(|c| *c) => break,
-            };
-            if self.on_frame(buf, permit).is_err() {
+        for item in items {
+            self.on_item(&mut st, item, permit.as_ref())?;
+            if st.destroyed {
                 break;
             }
         }
-        self.destroy();
+        Ok(())
     }
 
-    async fn write_loop(self, mut writer: impl FrameWrite, mut rx: mpsc::UnboundedReceiver<Bytes>) {
-        let mut closed = self.shared.closed.subscribe();
+    async fn read_loop(shared: std::sync::Weak<Shared>, mut reader: impl FrameRead) {
+        let Some(initial) = shared.upgrade() else {
+            return;
+        };
+        let mut closed = initial.closed.subscribe();
+        drop(initial);
+        loop {
+            // Back-pressure for unpaired remote channels, as in JS.
+            loop {
+                let Some(current) = shared.upgrade() else {
+                    return;
+                };
+                let paused = {
+                    let st = current.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.buffered > MAX_BUFFERED && !st.destroyed
+                };
+                let resume = current.resume.clone();
+                let inbound = current.inbound.clone();
+                drop(current);
+                if paused {
+                    tokio::select! {
+                        _ = resume.notified() => continue,
+                        _ = closed.wait_for(|c| *c) => return,
+                    }
+                }
+                let frame = tokio::select! {
+                    f = reader.read() => f,
+                    _ = closed.wait_for(|c| *c) => return,
+                };
+                let buf = match frame {
+                    Ok(Some(buf)) if buf.is_empty() => break,
+                    Ok(Some(buf)) => buf,
+                    Ok(None) | Err(_) => {
+                        if let Some(shared) = shared.upgrade() {
+                            Mux { shared }.destroy();
+                        }
+                        return;
+                    }
+                };
+                let items = match frame::decode(buf) {
+                    Ok(Frame::Single(item)) => Ok(vec![item]),
+                    Ok(Frame::Batch(items)) => items.collect::<Result<Vec<_>, _>>(),
+                    Err(error) => Err(error),
+                };
+                let items = match items {
+                    Ok(items) => items,
+                    Err(_) => {
+                        if let Some(shared) = shared.upgrade() {
+                            Mux { shared }.destroy();
+                        }
+                        return;
+                    }
+                };
+                let message_bytes = items.iter().fold(0usize, |total, item| match item {
+                    Item::Message { payload, .. } => total.saturating_add(payload.len().max(1)),
+                    _ => total,
+                });
+                let permit = if message_bytes == 0 {
+                    None
+                } else {
+                    let permits = message_bytes.min(INBOUND_BUDGET) as u32;
+                    Some(tokio::select! {
+                        p = inbound.acquire_many_owned(permits) => p.expect("semaphore never closed"),
+                        _ = closed.wait_for(|c| *c) => return,
+                    })
+                };
+                let Some(current) = shared.upgrade() else {
+                    return;
+                };
+                let mux = Mux { shared: current };
+                if mux.on_frame(items, permit).is_err() {
+                    mux.destroy();
+                    return;
+                }
+                break;
+            }
+        }
+    }
+
+    async fn write_loop(
+        shared: std::sync::Weak<Shared>,
+        mut writer: impl FrameWrite,
+        mut rx: mpsc::UnboundedReceiver<Bytes>,
+    ) {
+        let Some(initial) = shared.upgrade() else {
+            let _ = writer.close().await;
+            return;
+        };
+        let mut closed = initial.closed.subscribe();
+        drop(initial);
         loop {
             let frame = tokio::select! {
                 biased;
@@ -844,10 +926,11 @@ impl Mux {
             let Some(frame) = frame else { break };
             let len = frame.len();
             if writer.write(frame).await.is_err() {
-                self.destroy();
-                return;
+                break;
             }
-            self.wrote(len);
+            if let Some(shared) = shared.upgrade() {
+                Mux { shared }.wrote(len);
+            }
         }
         // Flush what was queued before the close, e.g. channel close frames.
         while let Ok(frame) = rx.try_recv() {
@@ -855,7 +938,9 @@ impl Mux {
             if writer.write(frame).await.is_err() {
                 break;
             }
-            self.wrote(len);
+            if let Some(shared) = shared.upgrade() {
+                Mux { shared }.wrote(len);
+            }
         }
         let _ = writer.close().await;
     }
@@ -864,6 +949,15 @@ impl Mux {
         let before = self.shared.queued.fetch_sub(len, Ordering::AcqRel);
         if before >= OUTBOUND_HIGH_WATER && before - len < OUTBOUND_HIGH_WATER {
             self.shared.drained.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Mux {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.shared) == 1 {
+            let mut st = self.lock();
+            self.shutdown(&mut st);
         }
     }
 }
