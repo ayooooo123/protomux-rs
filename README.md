@@ -34,7 +34,10 @@ match cb.recv().await {
   unpaired open, releases its buffered messages and rejects the open, even while the request is
   held. The reject frees the remote's channel id, so the remote does not take our next open for
   the same key as the answer to its closed channel, and a late pairing cannot resurrect the
-  closed channel id. `id: None` matches any id, which is how Corestore opens cores on demand.
+  closed channel id. A pairer that does slow work before it opens can call
+  `PairRequest::is_wanted()`: after such a close it returns `false`, and a channel opened anyway
+  sends a new open that the remote did not ask for. `id: None` matches any id, which is how
+  Corestore opens cores on demand.
 - **Setup window** (`mux.ready()`): the reader starts in `Mux::new`, so opens can arrive while the
   caller is still attaching protocols. Those are held until `Mux::pair` or a matching
   `open_channel`, or rejected by `Mux::ready()`, which declares setup done; after it, an open with

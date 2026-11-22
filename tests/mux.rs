@@ -762,6 +762,42 @@ async fn close_of_a_held_open_behind_a_delivered_one_is_not_offered_again() {
     b.destroy();
 }
 
+/// A pairer that loads something before it answers can ask whether the remote still wants the
+/// channel. Once the remote closes its open, the request is no longer wanted, so the pairer can
+/// skip its work and send no OPEN that nobody asked for.
+#[tokio::test]
+async fn request_for_a_closed_open_is_no_longer_wanted() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("p", None);
+    let mut markers = b.pair("marker", None);
+    let early = a.open_channel(opts("p", b"id", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    assert!(request.is_wanted());
+    early.close();
+    // A marker from A proves B parsed the close.
+    let _marker = a.open_channel(opts("marker", b"", b"")).unwrap();
+    let marker_request = markers.recv().await.unwrap();
+    assert!(!request.is_wanted());
+    drop(marker_request);
+    a.destroy();
+    b.destroy();
+}
+
+#[tokio::test]
+async fn request_answered_by_another_channel_is_no_longer_wanted() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("p", None);
+    let mut ca = a.open_channel(opts("p", b"id", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    let mut cb = b.open_channel(opts("p", b"id", b"")).unwrap();
+    assert!(!request.is_wanted());
+    assert!(ca.opened().await.is_some());
+    assert!(cb.opened().await.is_some());
+    drop(request);
+    a.destroy();
+    b.destroy();
+}
+
 #[tokio::test]
 async fn remote_open_backlog_destroys_mux() {
     let (a, b) = pair_of_muxes(2048);

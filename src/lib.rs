@@ -209,6 +209,24 @@ impl Drop for PairRequest {
     }
 }
 
+impl PairRequest {
+    /// Whether a remote open for this key still waits for an answer. A pairer that does slow work
+    /// before it opens (such as loading a core from storage) can check this before and after that
+    /// work. Once the remote has closed its open (we rejected it) or another local channel has
+    /// answered it, a new channel would send an OPEN that nobody asked for.
+    pub fn is_wanted(&self) -> bool {
+        let Some(mux) = &self.mux else {
+            return false;
+        };
+        let st = mux.lock();
+        !st.destroyed
+            && st
+                .infos
+                .get(&self.key)
+                .is_some_and(|info| !info.incoming.is_empty())
+    }
+}
+
 pub struct ChannelOptions<'a> {
     pub protocol: &'a str,
     pub id: Option<&'a [u8]>,
