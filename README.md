@@ -31,9 +31,10 @@ match cb.recv().await {
 - **Pairing** (`mux.pair()` in JS): `Mux::pair(protocol, id)` yields a `PairRequest` when the
   remote opens a channel we have not opened. Open the matching channel while holding the request;
   the remote open is rejected when the request drops unanswered. A remote close cancels an
-  unpaired open and releases its buffered messages, even while the request is held, so a late
-  pairing cannot resurrect the closed channel id. `id: None` matches any id, which is how Corestore
-  opens cores on demand.
+  unpaired open, releases its buffered messages and rejects the open, even while the request is
+  held. The reject frees the remote's channel id, so the remote does not take our next open for
+  the same key as the answer to its closed channel, and a late pairing cannot resurrect the
+  closed channel id. `id: None` matches any id, which is how Corestore opens cores on demand.
 - **Setup window** (`mux.ready()`): the reader starts in `Mux::new`, so opens can arrive while the
   caller is still attaching protocols. Those are held until `Mux::pair` or a matching
   `open_channel`, or rejected by `Mux::ready()`, which declares setup done; after it, an open with
@@ -62,6 +63,11 @@ timers.
 
 - A mux destroys a remote peer that exceeds 1,024 pending remote opens. Pending open handshakes
   count toward the 32 KiB pending buffer. npm protomux 3.13.1 leaves this backlog unbounded.
+- A remote close of an open we have not paired yet rejects that open. npm protomux 3.13.1 and
+  3.13.0 (the version that `tests/js` pins) ignore such a close: the open stays pending until its
+  pairer answers or declines it. If the pairer answers, npm keeps a channel that the remote has
+  already closed. When the remote then uses the id of the closed channel again, npm destroys the
+  stream with "Invalid open message".
 - There is no `watch()` for passively opened channels; a JS sender's batch does not cork our
   replies; a nested batch frame (never produced by either implementation) is an error.
 
@@ -71,8 +77,8 @@ timers.
 - `tests/interop.rs`: a Node peer running npm protomux on Hyperswarm and a Rust peer on a
   peeroxide swarm, on a local HyperDHT testnet, so the connection is holepunched UDX with
   secret-stream as apps run it. Both sides open, pair, batch, reject and stream 8 MiB through a
-  back-pressured channel, with each side as the Noise initiator in turn. Needs `npm install` in
-  `tests/js`.
+  back-pressured channel, and JS closes an open that Rust is still pairing and opens it again,
+  with each side as the Noise initiator in turn. Needs `npm install` in `tests/js`.
 - `fuzz/`: `cargo +nightly fuzz run frame` exercises the frame decoder.
 
 ## License

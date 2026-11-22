@@ -112,4 +112,29 @@ function run(ss) {
   // Rust declines this one.
   const rej = mux.createChannel({ protocol: 'rust/rejects', onclose: (remote) => log('js-rejected ' + remote) })
   rej.open()
+
+  // Once Rust opens `rust/closes-go`, we open and close `js/closes` in one batch while Rust's
+  // pairer is asked about it. Rust answers after the close and then asks us to open the key
+  // again: that open must get Rust's answer.
+  const reopen = () => {
+    const again = mux.createChannel({
+      protocol: 'js/closes',
+      id: Buffer.from('k'),
+      handshake: c.string,
+      onopen: (hs) => log('js-closes-reopened ' + hs)
+    })
+    again.open('again')
+  }
+  mux.pair({ protocol: 'rust/closes-go' }, () => {
+    const go = mux.createChannel({
+      protocol: 'rust/closes-go',
+      messages: [{ encoding: c.raw, onmessage: reopen }]
+    })
+    go.open()
+    mux.cork()
+    const closed = mux.createChannel({ protocol: 'js/closes', id: Buffer.from('k') })
+    closed.open()
+    closed.close()
+    mux.uncork()
+  })
 }

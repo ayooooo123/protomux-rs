@@ -57,6 +57,7 @@ fn spawn_node(args: &[&str]) -> Child {
 async fn scenario(mux: Mux) {
     let mut js_first = mux.pair("js/first", None);
     let mut rejects = mux.pair("rust/rejects", None);
+    let mut closes = mux.pair("js/closes", None);
 
     let mut both = mux
         .open_channel(ChannelOptions {
@@ -158,6 +159,41 @@ async fn scenario(mux: Mux) {
         got += data.len();
     }
     assert_eq!(got, 4 * 1024 * 1024);
+
+    // Once `rust/closes-go` opens, JS opens and closes `js/closes` in one batch, so we have read
+    // the close when the pair request arrives. We answer the request after the close, as a
+    // replicating core does, and then ask JS to open the key again: that open must reach our
+    // pairer as a new open, and JS must get our answer to it.
+    let mut go = mux
+        .open_channel(ChannelOptions::new("rust/closes-go"))
+        .unwrap();
+    go.opened().await.unwrap();
+    let req = closes.recv().await.unwrap();
+    let answer = mux
+        .open_channel(ChannelOptions {
+            id: Some(b"k"),
+            ..ChannelOptions::new("js/closes")
+        })
+        .unwrap();
+    drop(req);
+    go.send_raw(0, b"reopen");
+    let again = timeout(Duration::from_secs(5), closes.recv())
+        .await
+        .expect("JS's second open of the key never reached our pairer")
+        .unwrap();
+    let mut reopened = mux
+        .open_channel(ChannelOptions {
+            id: Some(b"k"),
+            handshake: &cstr("rust-again"),
+            ..ChannelOptions::new("js/closes")
+        })
+        .unwrap();
+    drop(again);
+    assert_eq!(
+        decode::<String>(reopened.opened().await.unwrap()).unwrap(),
+        "again"
+    );
+    drop(answer);
 }
 
 async fn run(mux: Mux, mut node: Child) {
@@ -187,6 +223,7 @@ async fn run(mux: Mux, mut node: Child) {
         "both-open rust",
         "both-msg from-rust",
         "js-rejected true",
+        "js-closes-reopened rust-again",
         "stream-closed",
     ] {
         assert!(
