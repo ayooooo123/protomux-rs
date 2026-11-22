@@ -719,7 +719,8 @@ impl Mux {
                         info.pairing -= 1;
                     }
                     info.incoming.remove(index);
-                    self.clear_remote(st, remote_id);
+                    // Unlike JS, reject: the remote keeps the id queued until we answer.
+                    self.reject_remote(st, remote_id);
                     self.gc(st, &k);
                 }
                 Ok(())

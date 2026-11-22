@@ -383,25 +383,28 @@ async fn destroy_closes_both_sides() {
 async fn close_before_async_pairing_allows_remote_id_reuse() {
     let (a, b) = pair_of_muxes(16);
     let mut requests = b.pair("lazy", None);
-    let mut markers = b.pair("marker", None);
     let mut next_requests = b.pair("next", None);
+    // An open channel whose messages show how far each side has read the other.
+    let mut ctl_a = a.open_channel(opts("ctl", b"", b"")).unwrap();
+    let mut ctl_b = b.open_channel(opts("ctl", b"", b"")).unwrap();
+    ctl_a.opened().await.unwrap();
+    ctl_b.opened().await.unwrap();
+
     let old = a.open_channel(opts("lazy", b"id", b"")).unwrap();
     let old_id = old.local_id();
     old.send_raw(0, b"buffered before close");
     old.close();
     let request = requests.recv().await.unwrap();
 
-    // The marker proves B parsed the close while its pair request was still held.
-    let mut marker_a = a.open_channel(opts("marker", b"", b"")).unwrap();
-    let marker_request = markers.recv().await.unwrap();
+    // B read the close while its pair request was still held.
+    ctl_a.send_raw(0, b"closed");
+    assert_eq!(msg(&mut ctl_b).await.1, b"closed");
     let late = b.open_channel(opts("lazy", b"id", b"")).unwrap();
     drop(request);
-    let mut marker_b = b.open_channel(opts("marker", b"", b"")).unwrap();
-    drop(marker_request);
-    marker_a.opened().await.unwrap();
-    marker_b.opened().await.unwrap();
 
-    // A parsed the late acknowledgement and can reuse its closed channel's id.
+    // A read everything B sent for the closed open, so it can reuse the closed channel's id.
+    ctl_b.send_raw(0, b"answered");
+    assert_eq!(msg(&mut ctl_a).await.1, b"answered");
     let mut next_a = a.open_channel(opts("next", b"id", b"")).unwrap();
     assert_eq!(next_a.local_id(), old_id);
     let next_request = timeout(Duration::from_secs(5), next_requests.recv())
@@ -417,6 +420,222 @@ async fn close_before_async_pairing_allows_remote_id_reuse() {
     assert!(!a.is_destroyed());
     assert!(!b.is_destroyed());
     late.close();
+    a.destroy();
+    b.destroy();
+}
+
+/// B answers A's open before it reads A's close, so the answer arrives for a channel that A has
+/// already closed. A drops that answer and frees the closed channel's id. A remote that ignores
+/// the close of an unpaired open, as npm protomux does, answers in this way.
+#[tokio::test]
+async fn answer_after_local_close_frees_the_channel_id() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("lazy", None);
+    let mut next_requests = b.pair("next", None);
+    let mut ctl_a = a.open_channel(opts("ctl", b"", b"")).unwrap();
+    let mut ctl_b = b.open_channel(opts("ctl", b"", b"")).unwrap();
+    ctl_a.opened().await.unwrap();
+    ctl_b.opened().await.unwrap();
+
+    let old = a.open_channel(opts("lazy", b"id", b"")).unwrap();
+    let old_id = old.local_id();
+    let request = requests.recv().await.unwrap();
+    // No await between the answer and the close: neither side has read the other's frame.
+    let mut answer = b.open_channel(opts("lazy", b"id", b"")).unwrap();
+    drop(request);
+    old.close();
+
+    // A read the answer after its own close. B read the close after its own answer.
+    ctl_b.send_raw(0, b"answered");
+    assert_eq!(msg(&mut ctl_a).await.1, b"answered");
+    ctl_a.send_raw(0, b"closed");
+    assert_eq!(msg(&mut ctl_b).await.1, b"closed");
+    assert!(answer.opened().await.is_some());
+    assert!(matches!(
+        next(&mut answer).await,
+        Event::Closed { remote: true }
+    ));
+
+    let mut next_a = a.open_channel(opts("next", b"id", b"")).unwrap();
+    assert_eq!(next_a.local_id(), old_id);
+    let next_request = timeout(Duration::from_secs(5), next_requests.recv())
+        .await
+        .expect("reused channel id was not accepted")
+        .expect("mux was destroyed by the reused channel id");
+    let mut next_b = b.open_channel(opts("next", b"id", b"")).unwrap();
+    drop(next_request);
+    next_a.opened().await.unwrap();
+    next_b.opened().await.unwrap();
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
+    a.destroy();
+    b.destroy();
+}
+
+/// A closes a channel while B's pairer still holds the request for it. A keeps the closed id
+/// queued until B answers or rejects that open, and takes the next open B sends for the same
+/// key as that answer. So B must still settle the closed open: otherwise A's next channel for
+/// the key never opens, while B's side of it opens.
+#[tokio::test]
+async fn close_before_async_pairing_leaves_the_next_open_for_the_key() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("core", None);
+    let mut b_markers = b.pair("marker", None);
+    let _a_requests = a.pair("core", None);
+    let mut a_markers = a.pair("marker", None);
+
+    let old = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    old.close();
+
+    // A marker from A proves B parsed the close while it still held the pair request.
+    let mut marker_a = a.open_channel(opts("marker", b"1", b"")).unwrap();
+    let marker_request = b_markers.recv().await.unwrap();
+    let mut marker_b = b.open_channel(opts("marker", b"1", b"")).unwrap();
+    drop(marker_request);
+    marker_a.opened().await.unwrap();
+    marker_b.opened().await.unwrap();
+
+    // B's pairer answers now, as a replicating core does: it opens a channel for the key.
+    let mut core_b = b.open_channel(opts("core", b"dk", b"")).unwrap();
+    drop(request);
+
+    // A marker from B proves A parsed what B sent for the key.
+    let mut marker_b = b.open_channel(opts("marker", b"2", b"")).unwrap();
+    let marker_request = a_markers.recv().await.unwrap();
+    let mut marker_a = a.open_channel(opts("marker", b"2", b"")).unwrap();
+    drop(marker_request);
+    marker_b.opened().await.unwrap();
+    marker_a.opened().await.unwrap();
+
+    // A opens the key again, as a core opened again does when it attaches.
+    let mut core_a = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    let opened = timeout(Duration::from_secs(5), core_a.opened())
+        .await
+        .expect("A's new channel for the key never opened");
+    assert!(opened.is_some());
+    assert!(core_b.opened().await.is_some());
+    core_a.send_raw(0, b"after reopen");
+    assert_eq!(msg(&mut core_b).await.1, b"after reopen");
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
+    a.destroy();
+    b.destroy();
+}
+
+/// A closes a channel while B's pairer holds the request for it, and opens the key again at
+/// once, under a new id. B's pairer then opens one channel for the key, which pairs with A's new
+/// open. If A still kept the closed id first in its queue, it would take B's open as the closed
+/// channel's answer, and its new channel would never open.
+#[tokio::test]
+async fn reopen_before_async_pairing_pairs_with_the_new_open() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("core", None);
+    let old = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    old.close();
+    let mut core_a = a.open_channel(opts("core", b"dk", b"")).unwrap();
+
+    // B parsed the close before the second open, which it asks about as well.
+    let second = requests.recv().await.unwrap();
+    let mut core_b = b.open_channel(opts("core", b"dk", b"")).unwrap();
+    drop(request);
+    drop(second);
+
+    let opened = timeout(Duration::from_secs(5), core_a.opened())
+        .await
+        .expect("A's new channel for the key never opened");
+    assert!(opened.is_some());
+    assert!(core_b.opened().await.is_some());
+    core_a.send_raw(0, b"after reopen");
+    assert_eq!(msg(&mut core_b).await.1, b"after reopen");
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
+    a.destroy();
+    b.destroy();
+}
+
+/// A closes a channel while B's pairer holds the request for it, and the pairer then declines
+/// the request. Later B opens the key itself, as a core does when it starts to replicate. A must
+/// take that open as a new remote open. If A still kept the closed id queued, it would take the
+/// open as the closed channel's answer and drop it, and B's channel would never open.
+#[tokio::test]
+async fn close_before_a_declining_pairer_leaves_the_next_open_for_the_key() {
+    let (a, b) = pair_of_muxes(16);
+    let mut requests = b.pair("core", None);
+    let mut b_markers = b.pair("marker", None);
+    let mut a_requests = a.pair("core", None);
+
+    let old = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    let request = requests.recv().await.unwrap();
+    old.close();
+
+    // A marker from A proves B parsed the close while it still held the pair request.
+    let mut marker_a = a.open_channel(opts("marker", b"1", b"")).unwrap();
+    let marker_request = b_markers.recv().await.unwrap();
+    let mut marker_b = b.open_channel(opts("marker", b"1", b"")).unwrap();
+    drop(marker_request);
+    marker_a.opened().await.unwrap();
+    marker_b.opened().await.unwrap();
+
+    // B's pairer declines: it has no channel for the key yet.
+    drop(request);
+
+    let mut core_b = b.open_channel(opts("core", b"dk", b"")).unwrap();
+    let a_request = timeout(Duration::from_secs(5), a_requests.recv())
+        .await
+        .expect("A took B's open of the key as the closed channel's answer")
+        .expect("A's mux was destroyed");
+    let mut core_a = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    drop(a_request);
+    assert!(core_a.opened().await.is_some());
+    let opened = timeout(Duration::from_secs(5), core_b.opened())
+        .await
+        .expect("B's channel for the key never opened");
+    assert!(opened.is_some());
+    core_b.send_raw(0, b"after the decline");
+    assert_eq!(msg(&mut core_a).await.1, b"after the decline");
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
+    a.destroy();
+    b.destroy();
+}
+
+/// A opens and closes a channel before B has a pairer for its protocol, so B still holds the open
+/// unasked when the close arrives. Later B opens the key itself. A must take that open as a new
+/// remote open, not as the closed channel's answer.
+#[tokio::test]
+async fn close_before_setup_leaves_the_next_open_for_the_key() {
+    let (a, b) = pair_of_muxes(16);
+    let mut b_markers = b.pair("marker", None);
+    let mut a_requests = a.pair("core", None);
+    let old = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    old.close();
+
+    // A marker from A proves B parsed the close.
+    let mut marker_a = a.open_channel(opts("marker", b"", b"")).unwrap();
+    let marker_request = b_markers.recv().await.unwrap();
+    let mut marker_b = b.open_channel(opts("marker", b"", b"")).unwrap();
+    drop(marker_request);
+    marker_a.opened().await.unwrap();
+    marker_b.opened().await.unwrap();
+
+    let mut core_b = b.open_channel(opts("core", b"dk", b"")).unwrap();
+    let a_request = timeout(Duration::from_secs(5), a_requests.recv())
+        .await
+        .expect("A took B's open of the key as the closed channel's answer")
+        .expect("A's mux was destroyed");
+    let mut core_a = a.open_channel(opts("core", b"dk", b"")).unwrap();
+    drop(a_request);
+    assert!(core_a.opened().await.is_some());
+    let opened = timeout(Duration::from_secs(5), core_b.opened())
+        .await
+        .expect("B's channel for the key never opened");
+    assert!(opened.is_some());
+    core_b.send_raw(0, b"after the close");
+    assert_eq!(msg(&mut core_a).await.1, b"after the close");
+    assert!(!a.is_destroyed());
+    assert!(!b.is_destroyed());
     a.destroy();
     b.destroy();
 }
