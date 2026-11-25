@@ -34,7 +34,10 @@ match cb.recv().await {
   unpaired open, releases its buffered messages and rejects the open, even while the request is
   held. The reject frees the remote's channel id, so the remote does not take our next open for
   the same key as the answer to its closed channel, and a late pairing cannot resurrect the
-  closed channel id. `id: None` matches any id, which is how Corestore opens cores on demand.
+  closed channel id. A pairer that does slow work before it opens can call
+  `PairRequest::is_wanted()`: after such a close it returns `false`, and a channel opened anyway
+  sends a new open that the remote did not ask for. `id: None` matches any id, which is how
+  Corestore opens cores on demand.
 - **Setup window** (`mux.ready()`): the reader starts in `Mux::new`, so opens can arrive while the
   caller is still attaching protocols. Those are held until `Mux::pair` or a matching
   `open_channel`, or rejected by `Mux::ready()`, which declares setup done; after it, an open with
@@ -64,10 +67,16 @@ timers.
 - A mux destroys a remote peer that exceeds 1,024 pending remote opens. Pending open handshakes
   count toward the 32 KiB pending buffer. npm protomux 3.13.1 leaves this backlog unbounded.
 - A remote close of an open we have not paired yet rejects that open. npm protomux 3.13.1 and
-  3.13.0 (the version that `tests/js` pins) ignore such a close: the open stays pending until its
-  pairer answers or declines it. If the pairer answers, npm keeps a channel that the remote has
-  already closed. When the remote then uses the id of the closed channel again, npm destroys the
-  stream with "Invalid open message".
+  3.13.0 (the version that `tests/js` pins) ignore such a close: an open that waits for its pairer
+  stays pending until the pairer answers or declines it. If the pairer answers, npm keeps a channel
+  that the remote has already closed. If the remote then uses the id of the closed channel again
+  while that channel is still open, npm destroys the stream with "Invalid open message".
+  One order of events still goes wrong: an open under an alias name can answer the closed channel
+  first, so the remote frees the id before our REJECT arrives. If the remote has given that id to
+  a newer open that still waits for our answer, the REJECT closes that newer channel; otherwise
+  the remote destroys the stream for an invalid reject.
+  hypercore and hypercore-rs peers do not cause that order: both open under `hypercore/alpha` (the
+  alias is `hypercore`), and hypercore creates and opens its channel in one function.
 - There is no `watch()` for passively opened channels; a JS sender's batch does not cork our
   replies; a nested batch frame (never produced by either implementation) is an error.
 

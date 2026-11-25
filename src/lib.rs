@@ -209,6 +209,24 @@ impl Drop for PairRequest {
     }
 }
 
+impl PairRequest {
+    /// Whether a remote open for this key still waits for an answer. A pairer that does slow work
+    /// before it opens (such as loading a core from storage) can check this before and after that
+    /// work. Once the remote has closed its open (we rejected it) or another local channel has
+    /// answered it, a new channel would send an OPEN that nobody asked for.
+    pub fn is_wanted(&self) -> bool {
+        let Some(mux) = &self.mux else {
+            return false;
+        };
+        let st = mux.lock();
+        !st.destroyed
+            && st
+                .infos
+                .get(&self.key)
+                .is_some_and(|info| !info.incoming.is_empty())
+    }
+}
+
 pub struct ChannelOptions<'a> {
     pub protocol: &'a str,
     pub id: Option<&'a [u8]>,
@@ -700,10 +718,14 @@ impl Mux {
                 Ok(())
             }
             Item::Close { remote_id } => {
-                let Some(remote) = remote_index(remote_id).and_then(|i| st.remote.get(i)) else {
+                // Nothing waits for an id whose slot is clear: we already closed or rejected it.
+                let Some(remote) = remote_index(remote_id)
+                    .and_then(|i| st.remote.get(i))
+                    .and_then(Option::as_ref)
+                else {
                     return Ok(());
                 };
-                let session = remote.as_ref().and_then(|r| r.session);
+                let session = remote.session;
                 if let Some(local_id) = session {
                     self.close_slot(st, local_id, true);
                 } else if let Some((k, index)) = st.infos.iter().find_map(|(k, info)| {
@@ -1072,5 +1094,42 @@ impl ChannelSender {
             self.mux
                 .write(&mut st, 0, CONTROL_CLOSE, uint_len(id), |w| w.uint(id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A closes a channel before B answers it, then B rejects it. A must forget the protocol's
+    /// entry and its alias: nothing else collects them once the local channel is gone.
+    #[tokio::test]
+    async fn reject_after_a_local_close_leaves_no_protocol_state() {
+        let ((ar, aw), (br, bw)) = memory::duplex(16);
+        let a = Mux::new(ar, aw, StreamInfo::default());
+        let b = Mux::new(br, bw, StreamInfo::default());
+        b.ready();
+        let mut markers = b.pair("marker", None);
+        let early = a
+            .open_channel(ChannelOptions {
+                aliases: &["alias"],
+                ..ChannelOptions::new("p")
+            })
+            .unwrap();
+        early.close();
+        // B sends its REJECT before it answers the marker, so A has read the REJECT once the
+        // marker opens.
+        let mut marker_a = a.open_channel(ChannelOptions::new("marker")).unwrap();
+        let request = markers.recv().await.unwrap();
+        let _marker_b = b.open_channel(ChannelOptions::new("marker")).unwrap();
+        drop(request);
+        assert!(marker_a.opened().await.is_some());
+        {
+            let st = a.lock();
+            assert!(!st.infos.contains_key(&key("p", None)), "A kept the entry");
+            assert!(st.aliases.is_empty(), "A kept the alias");
+        }
+        a.destroy();
+        b.destroy();
     }
 }
