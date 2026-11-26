@@ -852,13 +852,12 @@ impl Mux {
         }
         let k = key(&open.protocol, open.id.as_deref());
         let k = st.aliases.get(&k).unwrap_or(&k);
-        !st.infos.get(k).is_some_and(|info| !info.outgoing.is_empty())
+        !st.infos
+            .get(k)
+            .is_some_and(|info| !info.outgoing.is_empty())
     }
 
-    async fn wait_for_backlog_room(
-        &self,
-        closed: &mut watch::Receiver<bool>,
-    ) -> Result<(), Error> {
+    async fn wait_for_backlog_room(&self, closed: &mut watch::Receiver<bool>) -> Result<(), Error> {
         let deadline = tokio::time::Instant::now() + BACKLOG_STALL;
         loop {
             let notified = self.shared.backlog_room.notified();
