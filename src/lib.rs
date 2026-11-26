@@ -6,6 +6,7 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use compact_encoding::protomux::{CONTROL_CLOSE, CONTROL_OPEN, CONTROL_REJECT, Open};
 use compact_encoding::{Bytes, Codec, Writer, uint_len};
@@ -25,8 +26,11 @@ const MAX_BUFFERED: usize = 32768;
 const MAX_BATCH: usize = 8 * 1024 * 1024;
 /// `send` reports "not drained" once this much is queued for the transport.
 pub const OUTBOUND_HIGH_WATER: usize = 2 * 1024 * 1024;
-/// Remote opens held for a pairer before the mux destroys hostile streams.
+/// Remote opens held for a pairer before the mux pauses or destroys stalled streams.
 const MAX_REMOTE_BACKLOG: usize = 1024;
+/// How long a full remote-open backlog may stall with no pairing progress before
+/// the mux destroys the stream.
+const BACKLOG_STALL: Duration = Duration::from_secs(2);
 /// Received bytes that channel consumers may hold before the mux stops
 /// reading from the transport.
 pub const INBOUND_BUDGET: usize = 8 * 1024 * 1024;
@@ -157,6 +161,7 @@ struct Shared {
     queued: AtomicUsize,
     drained: Notify,
     resume: Arc<Notify>,
+    backlog_room: Arc<Notify>,
     inbound: Arc<Semaphore>,
     closed: watch::Sender<bool>,
     serial: AtomicU64,
@@ -269,6 +274,7 @@ impl Mux {
                 queued: AtomicUsize::new(0),
                 drained: Notify::new(),
                 resume: Arc::new(Notify::new()),
+                backlog_room: Arc::new(Notify::new()),
                 inbound: Arc::new(Semaphore::new(INBOUND_BUDGET)),
                 closed,
                 serial: AtomicU64::new(0),
@@ -588,6 +594,9 @@ impl Mux {
         if st.buffered <= MAX_BUFFERED {
             self.shared.resume.notify_one();
         }
+        if st.remote_backlog < MAX_REMOTE_BACKLOG {
+            self.shared.backlog_room.notify_one();
+        }
     }
 
     fn close_slot(&self, st: &mut State, local_id: u64, remote: bool) {
@@ -831,20 +840,83 @@ impl Mux {
         Ok(())
     }
 
-    fn on_frame(
+    fn backlog_full_for(&self, st: &State, item: &Item) -> bool {
+        if st.remote_backlog < MAX_REMOTE_BACKLOG {
+            return false;
+        }
+        let Item::Open(open) = item else {
+            return false;
+        };
+        if open.local_id == 0 {
+            return false;
+        }
+        let k = key(&open.protocol, open.id.as_deref());
+        let k = st.aliases.get(&k).unwrap_or(&k);
+        !st.infos
+            .get(k)
+            .is_some_and(|info| !info.outgoing.is_empty())
+    }
+
+    async fn wait_for_backlog_room(&self, closed: &mut watch::Receiver<bool>) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + BACKLOG_STALL;
+        loop {
+            let notified = self.shared.backlog_room.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let st = self.lock();
+                if st.destroyed || st.remote_backlog < MAX_REMOTE_BACKLOG {
+                    return Ok(());
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::RemoteBacklog);
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep(remaining) => {
+                    let st = self.lock();
+                    if st.destroyed || st.remote_backlog < MAX_REMOTE_BACKLOG {
+                        return Ok(());
+                    }
+                    return Err(Error::RemoteBacklog);
+                }
+                _ = closed.wait_for(|c| *c) => return Ok(()),
+            }
+        }
+    }
+
+    async fn apply_frame(
         &self,
         items: Vec<Item>,
         permit: Option<OwnedSemaphorePermit>,
+        closed: &mut watch::Receiver<bool>,
     ) -> Result<(), Error> {
         let permit = permit.map(Arc::new);
-        let mut st = self.lock();
-        if st.destroyed {
-            return Ok(());
-        }
-        for item in items {
-            self.on_item(&mut st, item, permit.as_ref())?;
-            if st.destroyed {
-                break;
+        let mut items = items.into_iter().peekable();
+        while items.peek().is_some() {
+            let stalled = {
+                let mut st = self.lock();
+                if st.destroyed {
+                    return Ok(());
+                }
+                let mut hit_backlog = false;
+                while let Some(item) = items.peek() {
+                    if self.backlog_full_for(&st, item) {
+                        hit_backlog = true;
+                        break;
+                    }
+                    let item = items.next().expect("peeked");
+                    self.on_item(&mut st, item, permit.as_ref())?;
+                    if st.destroyed {
+                        return Ok(());
+                    }
+                }
+                hit_backlog
+            };
+            if stalled {
+                self.wait_for_backlog_room(closed).await?;
             }
         }
         Ok(())
@@ -920,7 +992,7 @@ impl Mux {
                     return;
                 };
                 let mux = Mux { shared: current };
-                if mux.on_frame(items, permit).is_err() {
+                if mux.apply_frame(items, permit, &mut closed).await.is_err() {
                     mux.destroy();
                     return;
                 }
