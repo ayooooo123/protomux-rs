@@ -851,6 +851,54 @@ async fn close_on_another_channel_bypasses_held_inbound_messages() {
 }
 
 #[tokio::test]
+async fn corked_opens_above_backlog_succeed_when_pairer_drains() {
+    let (a, b) = pair_of_muxes(2048);
+    let mut requests = b.pair("backlog", None);
+    let b_pair = b.clone();
+    let drainer = tokio::spawn(async move {
+        let mut count = 0usize;
+        while let Some(req) = requests.recv().await {
+            count += 1;
+            // Pair the last channel to prove the mux stayed healthy past 1024 opens.
+            if req.id.as_deref() == Some(&1999u16.to_le_bytes()[..]) {
+                let _ch = b_pair
+                    .open_channel(opts("backlog", &1999u16.to_le_bytes(), b"ok"))
+                    .unwrap();
+                drop(req);
+                break;
+            }
+            drop(req);
+        }
+        count
+    });
+
+    let mut channels = Vec::new();
+    a.cork();
+    for n in 0u16..2000 {
+        channels.push(
+            a.open_channel(opts("backlog", &n.to_le_bytes(), b"handshake"))
+                .unwrap(),
+        );
+    }
+    a.uncork();
+
+    let last = channels.last_mut().unwrap();
+    let hs = timeout(Duration::from_secs(5), last.opened())
+        .await
+        .expect("2000th corked open must pair once the pairer drains")
+        .expect("2000th channel must open");
+    assert_eq!(&hs[..], b"ok");
+    let seen = timeout(Duration::from_secs(5), drainer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen, 2000);
+    assert!(!b.is_destroyed());
+    a.destroy();
+    b.destroy();
+}
+
+#[tokio::test]
 async fn dropping_every_handle_closes_the_transport() {
     let (a, b) = pair_of_muxes(1);
     drop(a);
